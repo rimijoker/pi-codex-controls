@@ -1,3 +1,6 @@
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type CodexModel = NonNullable<ExtensionContext["model"]>;
@@ -20,6 +23,31 @@ export function isCodexResponsesModel(model: CodexModel | undefined): model is C
 export function addPriorityTier(payload: unknown): Payload | undefined {
 	if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return undefined;
 	return { ...(payload as Payload), service_tier: "priority" };
+}
+
+function modelKey(model: CodexModel): string {
+	return `${model.provider}/${model.id}`;
+}
+
+function loadExpandedModels(filePath: string): Set<string> {
+	try {
+		const data = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
+		if (typeof data !== "object" || data === null || Array.isArray(data)) return new Set();
+		const expandedModels = (data as { expandedModels?: unknown }).expandedModels;
+		return new Set(Array.isArray(expandedModels) ? expandedModels.filter((id): id is string => typeof id === "string") : []);
+	} catch {
+		return new Set();
+	}
+}
+
+function saveExpandedModels(filePath: string, expandedModels: Set<string>): boolean {
+	try {
+		mkdirSync(dirname(filePath), { recursive: true });
+		writeFileSync(filePath, `${JSON.stringify({ expandedModels: [...expandedModels] }, null, 2)}\n`, { mode: 0o600 });
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 function getState(states: WeakMap<object, SessionState>, ctx: ExtensionContext): SessionState {
@@ -55,18 +83,55 @@ function notify(ctx: ExtensionContext, message: string, type: "info" | "warning"
 	if (ctx.hasUI) ctx.ui.notify(message, type);
 }
 
+async function applySavedContext(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	state: SessionState,
+	expandedModels: Set<string>,
+): Promise<void> {
+	const model = ctx.model;
+	if (!isCodexResponsesModel(model) || state.largeContext || !expandedModels.has(modelKey(model))) return;
+
+	const catalogModel = ctx.modelRegistry.find(model.provider, model.id);
+	if (model.contextWindow >= LARGE_CONTEXT_WINDOW) {
+		state.largeContext = true;
+		state.originalModel = catalogModel && catalogModel.contextWindow < LARGE_CONTEXT_WINDOW ? catalogModel : undefined;
+		return;
+	}
+
+	state.applyingModel = true;
+	try {
+		const applied = await pi.setModel({ ...model, contextWindow: LARGE_CONTEXT_WINDOW });
+		if (!applied) {
+			notify(ctx, "Pi couldn't restore the saved context preference.", "warning");
+			return;
+		}
+		state.originalModel = catalogModel ?? model;
+		state.largeContext = true;
+	} catch (error) {
+		notify(ctx, `Couldn't restore the saved context preference: ${error instanceof Error ? error.message : String(error)}`, "warning");
+	} finally {
+		state.applyingModel = false;
+	}
+}
+
 export default function codexControls(pi: ExtensionAPI): void {
 	const states = new WeakMap<object, SessionState>();
+	const configDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+	const preferencesPath = join(configDir, "codex-controls.json");
+	const expandedModels = loadExpandedModels(preferencesPath);
 
-	pi.on("session_start", (_event, ctx) => {
-		updateStatus(ctx, getState(states, ctx));
+	pi.on("session_start", async (_event, ctx) => {
+		const state = getState(states, ctx);
+		await applySavedContext(pi, ctx, state, expandedModels);
+		updateStatus(ctx, state);
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		states.delete(ctx.sessionManager as object);
 	});
 
-	pi.on("model_select", (_event, ctx) => {
+	pi.on("model_select", async (_event, ctx) => {
 		const state = getState(states, ctx);
 		if (state.applyingModel) {
 			updateStatus(ctx, state);
@@ -77,6 +142,7 @@ export default function codexControls(pi: ExtensionAPI): void {
 			state.originalModel = undefined;
 			notify(ctx, "The context override was reset after changing models.");
 		}
+		await applySavedContext(pi, ctx, state, expandedModels);
 		updateStatus(ctx, state);
 	});
 
@@ -124,7 +190,15 @@ export default function codexControls(pi: ExtensionAPI): void {
 					}
 					state.largeContext = false;
 					state.originalModel = undefined;
-					notify(ctx, "Restored the model's catalog context budget.");
+					expandedModels.delete(modelKey(model));
+					const saved = saveExpandedModels(preferencesPath, expandedModels);
+					notify(
+						ctx,
+						saved
+							? "Restored the model's catalog context budget and saved the preference."
+							: "Restored the catalog budget for this session, but couldn't save the preference. It may return next session.",
+						saved ? "info" : "warning",
+					);
 				} else {
 					const expandedModel = { ...model, contextWindow: LARGE_CONTEXT_WINDOW };
 					const applied = await pi.setModel(expandedModel);
@@ -134,9 +208,11 @@ export default function codexControls(pi: ExtensionAPI): void {
 					}
 					state.originalModel = model;
 					state.largeContext = true;
+					expandedModels.add(modelKey(model));
+					const saved = saveExpandedModels(preferencesPath, expandedModels);
 					notify(
 						ctx,
-						"Pi will keep up to 1.05M tokens locally. This does not raise the endpoint's server limit; requests over that limit can fail.",
+						`Pi will keep up to 1.05M tokens locally. This does not raise the endpoint's server limit; requests over that limit can fail.${saved ? " Saved for this model across sessions." : " Couldn't save the preference; it will reset next session."}`,
 						"warning",
 					);
 				}

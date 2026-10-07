@@ -1,4 +1,7 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import codexControls, { addPriorityTier, isCodexResponsesModel, LARGE_CONTEXT_WINDOW } from "../extensions/codex-controls.ts";
 
@@ -14,7 +17,14 @@ const codexModel = {
 	maxTokens: 128_000,
 };
 
-function createHarness(options: { failSetModel?: boolean; initialModel?: typeof codexModel } = {}) {
+const preferenceDirs = new Set<string>();
+afterAll(() => {
+	for (const dir of preferenceDirs) rmSync(dir, { recursive: true, force: true });
+});
+
+function createHarness(
+	options: { failSetModel?: boolean; initialModel?: typeof codexModel; preferenceDir?: string } = {},
+) {
 	let model: typeof codexModel = options.initialModel ?? codexModel;
 	const sessionManager = {};
 	const handlers = new Map<string, Handler[]>();
@@ -60,7 +70,16 @@ function createHarness(options: { failSetModel?: boolean; initialModel?: typeof 
 		return result;
 	}
 
-	codexControls(api);
+	const preferenceDir = options.preferenceDir ?? mkdtempSync(join(tmpdir(), "pi-codex-controls-test-"));
+	preferenceDirs.add(preferenceDir);
+	const previousConfigDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = preferenceDir;
+	try {
+		codexControls(api);
+	} finally {
+		if (previousConfigDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousConfigDir;
+	}
 
 	return {
 		ctx,
@@ -179,6 +198,28 @@ describe("local context-window toggle", () => {
 		expect(h.statuses.get("codex-controls-context")).toBe("Context 1.05M*");
 		await h.commands.get("codex-context")!.handler("", h.ctx);
 		expect(h.model).toBe(codexModel);
+	});
+
+	it("persists context per model across sessions and clears the saved preference when disabled", async () => {
+		const preferenceDir = mkdtempSync(join(tmpdir(), "pi-codex-controls-persistence-test-"));
+		preferenceDirs.add(preferenceDir);
+		const first = createHarness({ preferenceDir });
+		await first.emit("session_start");
+		await first.commands.get("codex-context")!.handler("", first.ctx);
+
+		const otherModel = createHarness({ preferenceDir, initialModel: { ...codexModel, id: "gpt-6-sol" } });
+		await otherModel.emit("session_start");
+		expect(otherModel.model.contextWindow).toBe(272_000);
+
+		const second = createHarness({ preferenceDir });
+		await second.emit("session_start");
+		expect(second.model.contextWindow).toBe(LARGE_CONTEXT_WINDOW);
+		expect(second.statuses.get("codex-controls-context")).toBe("Context 1.05M*");
+		await second.commands.get("codex-context")!.handler("", second.ctx);
+
+		const third = createHarness({ preferenceDir });
+		await third.emit("session_start");
+		expect(third.model.contextWindow).toBe(272_000);
 	});
 
 	it("restores a local override after extension state is reinitialized", async () => {

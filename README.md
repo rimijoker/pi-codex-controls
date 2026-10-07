@@ -17,6 +17,9 @@ Restart Pi or run `/reload` after installation.
 - Run either command again to turn it off.
 
 The footer shows the active settings.
+Fast mode is session-scoped.
+Context preferences are saved per provider/model in `codex-controls.json` inside Pi's config directory (default `~/.pi/agent`) and restored in new sessions.
+Run `/codex-context` again to restore the catalog budget and clear that model's saved preference.
 
 ## Limits
 
