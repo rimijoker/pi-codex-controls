@@ -1,0 +1,23 @@
+{
+  "name": "pi-codex-controls",
+  "version": "0.1.0",
+  "description": "Fast mode and local context controls for OpenAI Codex models in Pi.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": ["pi-package", "pi", "openai-codex", "codex", "extension"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rimijoker/pi-codex-controls.git"
+  },
+  "homepage": "https://github.com/rimijoker/pi-codex-controls#readme",
+  "bugs": {
+    "url": "https://github.com/rimijoker/pi-codex-controls/issues"
+  },
+  "files": ["extensions", "test", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
